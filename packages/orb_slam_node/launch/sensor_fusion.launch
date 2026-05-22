@@ -1,0 +1,27 @@
+<launch>
+  <!-- Vehicle name -->
+  <arg name="veh" default="duckiebot21"/>
+
+  <!-- ORB-SLAM pipeline node -->
+  <node pkg="orb_slam_node" type="orb_slam_node.py" name="orb_slam_node" output="screen">
+    <param name="image_topic"       value="/$(arg veh)/camera_node/image/compressed"/>
+    <param name="camera_info_topic" value="/$(arg veh)/camera_node/camera_info"/>
+    <param name="n_features"     type="int"    value="5000"/>
+    <param name="max_map_points" type="int"    value="10000"/>
+    <rosparam param="camera_matrix">[3177.0, 0.0, 1632.0, 0.0, 3177.0, 1224.0, 0.0, 0.0, 1.0]</rosparam>
+  </node>
+
+  <!-- Wheel encoder odometry node -->
+  <group ns="$(arg veh)">
+    <node pkg="encoder_pose" type="encoder_pose_node.py" name="encoder_pose_node" output="screen"/>
+  </group>
+
+  <!-- Sensor fusion node (EKF: odometry predict + ORB-SLAM correct) -->
+  <node pkg="orb_slam_node" type="sensor_fusion_node.py" name="sensor_fusion_node" output="screen">
+    <param name="veh"        value="$(arg veh)"/>
+    <param name="odom_topic" value="/$(arg veh)/pose"/>
+    <param name="slam_topic" value="/orb_slam/camera_poses"/>
+  </node>
+
+
+</launch>

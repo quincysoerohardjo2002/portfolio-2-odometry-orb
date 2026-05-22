@@ -1,0 +1,20 @@
+<launch>
+  <!-- 
+    Point cloud visualizer — run this on your LAPTOP (not on the Duckiebot).
+    
+    Prerequisites:
+      1. ROS_MASTER_URI must point to the Duckiebot's roscore
+      2. ROS_IP must be set to your laptop's IP address
+      
+    Example:
+      export ROS_MASTER_URI=http://<duckiebot-ip>:11311
+      export ROS_IP=<your-laptop-ip>
+      roslaunch orb_slam_node visualizer.launch
+  -->
+
+  <node pkg="orb_slam_node" type="pointcloud_visualizer_node.py" name="pointcloud_visualizer_node" output="screen">
+    <param name="point_cloud_topic" value="/orb_slam/point_cloud"/>
+    <param name="max_display_pts"   type="int"    value="8000"/>
+    <param name="point_size"        type="double" value="2.0"/>
+  </node>
+</launch>

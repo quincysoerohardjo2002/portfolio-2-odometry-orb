@@ -12,7 +12,7 @@ dt-launchfile-init
 # NOTE: Use `dt-exec COMMAND` to run the main process (blocking process)
 
 # launching app
-dt-exec roslaunch orb_slam_node orb_slam.launch
+dt-exec roslaunch orb_slam_node sensor_fusion.launch
 
 # ----------------------------------------------------------------------------
 # YOUR CODE ABOVE THIS LINE

@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 
+import pickle
+import socket
+import struct
 import threading
 
 import cv2
@@ -8,6 +11,10 @@ import rospy
 import std_msgs.msg
 from sensor_msgs import point_cloud2 as pc2
 from sensor_msgs.msg import CameraInfo, CompressedImage, PointCloud2, PointField
+from std_msgs.msg import Float64MultiArray, MultiArrayDimension
+
+# TCP streaming port for the standalone visualizer
+TCP_STREAM_PORT = 9999
 
 
 class OrbSlamNode:
@@ -56,8 +63,19 @@ class OrbSlamNode:
         self._map_pts: list = []
         self._max_pts: int = rospy.get_param("~max_map_points", 10000)
 
+        # Accumulated camera poses (4x4 matrices)
+        self._poses_lock = threading.Lock()
+        self._poses: list = []
+
+        # TCP streaming server for standalone visualizer
+        self._tcp_clients: list = []
+        self._tcp_lock = threading.Lock()
+        self._start_tcp_server()
+
         # Publishers
         self._pc_pub = rospy.Publisher("/orb_slam/point_cloud", PointCloud2, queue_size=1)
+        self._img_pub = rospy.Publisher("/orb_slam/annotated_image", CompressedImage, queue_size=1)
+        self._poses_pub = rospy.Publisher("/orb_slam/camera_poses", Float64MultiArray, queue_size=1)
 
         # Subscribers
         rospy.Subscriber(
@@ -76,6 +94,50 @@ class OrbSlamNode:
         rospy.loginfo("[OrbSlamNode] Ready.")
 
     # ------------------------------------------------------------------
+    # TCP streaming server
+    # ------------------------------------------------------------------
+
+    def _start_tcp_server(self):
+        """Start a TCP server that streams SLAM data to connected clients."""
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(('0.0.0.0', TCP_STREAM_PORT))
+        server.listen(5)
+        server.settimeout(1.0)
+        t = threading.Thread(target=self._tcp_accept_loop, args=(server,), daemon=True)
+        t.start()
+        rospy.loginfo("[OrbSlamNode] TCP stream server started on port %d", TCP_STREAM_PORT)
+
+    def _tcp_accept_loop(self, server):
+        """Accept incoming TCP connections."""
+        while not rospy.is_shutdown():
+            try:
+                client, addr = server.accept()
+                client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                with self._tcp_lock:
+                    self._tcp_clients.append(client)
+                rospy.loginfo("[OrbSlamNode] Visualizer connected from %s", addr)
+            except socket.timeout:
+                continue
+            except Exception:
+                break
+
+    def _tcp_broadcast(self, data_dict):
+        """Send a pickled data frame to all connected TCP clients."""
+        payload = pickle.dumps(data_dict, protocol=pickle.HIGHEST_PROTOCOL)
+        header = struct.pack('!I', len(payload))
+        with self._tcp_lock:
+            dead = []
+            for i, client in enumerate(self._tcp_clients):
+                try:
+                    client.sendall(header + payload)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    dead.append(i)
+            for i in reversed(dead):
+                self._tcp_clients[i].close()
+                del self._tcp_clients[i]
+
+    # ------------------------------------------------------------------
 
     def _camera_info_cb(self, msg: CameraInfo):
         with self._K_lock:
@@ -85,9 +147,10 @@ class OrbSlamNode:
 
     def _image_cb(self, msg: CompressedImage):
         buf = np.frombuffer(msg.data, dtype=np.uint8)
-        frame = cv2.imdecode(buf, cv2.IMREAD_GRAYSCALE)
-        if frame is None:
+        frame_color = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        if frame_color is None:
             return
+        frame = cv2.cvtColor(frame_color, cv2.COLOR_BGR2GRAY)
 
         kp, desc = self._orb.detectAndCompute(frame, None)
         if desc is None or len(kp) < 8:
@@ -113,7 +176,11 @@ class OrbSlamNode:
         pts2 = np.float32([kp[m.trainIdx].pt for m in matches])
 
         # Fundamental matrix with RANSAC to filter outliers
-        F, mask = cv2.findFundamentalMat(pts1, pts2, cv2.FM_RANSAC)
+        try:
+            F, mask = cv2.findFundamentalMat(pts1, pts2, cv2.FM_RANSAC)
+        except cv2.error:
+            self._prev_kp, self._prev_desc = kp, desc
+            return
         if F is None or mask is None:
             self._prev_kp, self._prev_desc = kp, desc
             return
@@ -127,6 +194,20 @@ class OrbSlamNode:
         # Essential matrix → relative pose
         E = K.T @ F @ K
         _, R, t, _ = cv2.recoverPose(E, pts1_in, pts2_in, K)
+
+        # ------- Motion threshold -------
+        # Skip pose update if estimated motion is below noise level
+        # (prevents drift when the Duckiebot is stationary)
+        t_norm = np.linalg.norm(t)
+        angle = np.arccos(np.clip((np.trace(R) - 1.0) / 2.0, -1.0, 1.0))
+        MIN_TRANSLATION = 0.01   # minimum translation to count as real motion
+        MIN_ROTATION = np.radians(0.5)  # minimum rotation (0.5 degrees)
+
+        if t_norm < MIN_TRANSLATION and angle < MIN_ROTATION:
+            # No significant motion — still publish annotated image but skip map update
+            self._publish_annotated_image(frame_color, pts1_in, pts2_in)
+            self._prev_kp, self._prev_desc = kp, desc
+            return
 
         # Triangulate in the previous camera frame
         p1_n = cv2.undistortPoints(pts1_in.reshape(-1, 1, 2), K, None).reshape(-1, 2)
@@ -146,6 +227,13 @@ class OrbSlamNode:
         good = (pts_local[:, 2] > 0) & (pts_cam2[:, 2] > 0)
         pts_local = pts_local[good]
 
+        # ------- Outlier filtering -------
+        # Reject points that are unrealistically far from the camera
+        MAX_DEPTH = 50.0  # max distance in camera units
+        if len(pts_local) > 0:
+            dists = np.linalg.norm(pts_local, axis=1)
+            pts_local = pts_local[dists < MAX_DEPTH]
+
         if len(pts_local) > 0:
             # Transform from previous camera frame → world frame
             pts_world = (self._R_cw @ pts_local.T).T + self._t_cw.T
@@ -162,7 +250,61 @@ class OrbSlamNode:
         self._t_cw = self._t_cw - R_cw_new @ t
         self._R_cw = R_cw_new
 
+        # Store and publish camera pose
+        pose = np.eye(4)
+        pose[:3, :3] = self._R_cw
+        pose[:3, 3] = self._t_cw.ravel()
+        with self._poses_lock:
+            self._poses.append(pose)
+        self._publish_poses()
+
+        # Draw feature matches on the color image and publish
+        self._publish_annotated_image(frame_color, pts1_in, pts2_in)
+
         self._prev_kp, self._prev_desc = kp, desc
+
+    def _publish_annotated_image(self, img, pts1, pts2):
+        """Draw matched feature points and lines on the image, then publish."""
+        vis = img.copy()
+        for (x1, y1), (x2, y2) in zip(pts1.astype(int), pts2.astype(int)):
+            cv2.circle(vis, (x2, y2), 2, (77, 243, 255), -1)
+            cv2.line(vis, (x1, y1), (x2, y2), (255, 0, 0), 1)
+            cv2.circle(vis, (x1, y1), 2, (204, 77, 255), -1)
+
+        msg = CompressedImage()
+        msg.header.stamp = rospy.Time.now()
+        msg.format = "jpeg"
+        msg.data = np.array(cv2.imencode('.jpg', vis)[1]).tobytes()
+        self._img_pub.publish(msg)
+
+        # Stream to standalone TCP visualizer
+        with self._tcp_lock:
+            has_clients = len(self._tcp_clients) > 0
+        if has_clients:
+            with self._map_lock:
+                pts = np.array(self._map_pts, dtype=np.float64) if self._map_pts else np.empty((0, 3))
+            with self._poses_lock:
+                poses = np.array(self._poses, dtype=np.float64) if self._poses else np.empty((0, 4, 4))
+            self._tcp_broadcast({
+                'points': pts,
+                'poses': poses,
+                'image': vis,
+            })
+
+    def _publish_poses(self):
+        """Publish all camera poses as a flat array of 4x4 matrices."""
+        with self._poses_lock:
+            if not self._poses:
+                return
+            data = np.array(self._poses, dtype=np.float64).flatten()
+
+        msg = Float64MultiArray()
+        msg.layout.dim = [
+            MultiArrayDimension(label="poses", size=len(self._poses), stride=16 * len(self._poses)),
+            MultiArrayDimension(label="matrix", size=16, stride=16),
+        ]
+        msg.data = data.tolist()
+        self._poses_pub.publish(msg)
 
     def _publish_cloud(self):
         with self._map_lock:
