@@ -1,7 +1,7 @@
 # parameters
-ARG REPO_NAME="orb-slam-demo"
-ARG DESCRIPTION="ORB-SLAM demo for Duckietown — feature extraction, pose estimation, triangulation, and point cloud visualization"
-ARG MAINTAINER="Vikram Mark Radhakrishnan (vik.radhkrishn@gmail.com)"
+ARG REPO_NAME="portfolio-2-odometry-orb"
+ARG DESCRIPTION="Sensor Fusion: Wheel Odometry + Monocular ORB-SLAM via EKF for Duckietown"
+ARG MAINTAINER="Quincy Soerohardjo"
 # pick an icon from: https://fontawesome.com/v4.7.0/icons/
 ARG ICON="cube"
 
